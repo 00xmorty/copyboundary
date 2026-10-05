@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Read-only symlink boundary and special-file preflight."""
+import argparse
+import errno
+import json
+import os
+from pathlib import Path
+import stat
+
+VERSION = "0.1.0"
+
+
+def inspect_link(path, root):
+    try:
+        target = path.resolve(strict=False)
+        scope = "internal" if target.is_relative_to(root) else "external"
+        try:
+            path.stat()
+            state = "present"
+        except FileNotFoundError:
+            state = "broken"
+        except OSError:
+            state = "unknown"
+        return {"kind": "symlink", "scope": scope, "target_state": state}
+    except (OSError, RuntimeError):
+        return {"kind": "symlink", "scope": "unknown", "target_state": "unknown"}
+
+
+def scan(root, limit=10000):
+    root = Path(root)
+    if root.is_symlink():
+        raise ValueError("Root must be a real directory, not a symlink")
+    root = root.resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("Root must be a directory")
+    findings, pending, visited = [], [root], 0
+    incomplete = False
+    while pending and not incomplete:
+        directory = pending.pop()
+        # Recheck before opening: this is still not an atomic snapshot.
+        try:
+            if not stat.S_ISDIR(directory.lstat().st_mode):
+                raise OSError(errno.EAGAIN, "Directory changed")
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if visited >= limit:
+                        incomplete = True
+                        findings.append({"path": ".", "kind": "limit", "state": "unknown"})
+                        break
+                    visited += 1
+                    path = Path(entry.path)
+                    relative = path.relative_to(root).as_posix()
+                    try:
+                        mode = entry.stat(follow_symlinks=False).st_mode
+                        if stat.S_ISLNK(mode):
+                            item = inspect_link(path, root)
+                        elif stat.S_ISDIR(mode):
+                            pending.append(path)
+                            continue
+                        elif stat.S_ISREG(mode):
+                            continue
+                        else:
+                            item = {"kind": "special", "type": "fifo" if stat.S_ISFIFO(mode) else "other"}
+                    except OSError:
+                        item = {"kind": "unreadable", "state": "unknown"}
+                    findings.append({"path": relative, **item})
+        except OSError:
+            findings.append({"path": directory.relative_to(root).as_posix(),
+                             "kind": "unreadable", "state": "unknown"})
+    unknown = incomplete or any(x.get("state") == "unknown" or
+                               x.get("target_state") == "unknown" for x in findings)
+    risk = any(x["kind"] == "special" or x.get("scope") == "external" or
+               x.get("target_state") == "broken" for x in findings)
+    return {"version": VERSION, "visited": visited,
+            "status": "UNKNOWN" if unknown else "REVIEW" if risk else "NO_FLAGGED_RISK",
+            "findings": sorted(findings, key=lambda x: x["path"])}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("root", nargs="?", default=".")
+    parser.add_argument("--json", action="store_true", help="Print value-limited JSON")
+    parser.add_argument("--max-entries", type=int, default=10000)
+    parser.add_argument("--version", action="version", version=VERSION)
+    args = parser.parse_args()
+    if args.max_entries < 1:
+        parser.error("--max-entries must be positive")
+    try:
+        report = scan(args.root, args.max_entries)
+    except (OSError, ValueError, RuntimeError):
+        report = {"version": VERSION, "status": "UNKNOWN", "visited": 0,
+                  "findings": [{"path": ".", "kind": "unreadable", "state": "unknown"}]}
+    if args.json:
+        print(json.dumps(report, ensure_ascii=True, sort_keys=True))
+    else:
+        print("CopyBoundary: " + report["status"])
+        print("Entries checked: " + str(report["visited"]))
+        for item in report["findings"]:
+            print(json.dumps(item, ensure_ascii=True, sort_keys=True))
+        print("No files copied or modified. No safe-copy guarantee.")
+    return {"NO_FLAGGED_RISK": 0, "REVIEW": 1, "UNKNOWN": 2}[report["status"]]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
